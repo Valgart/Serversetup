@@ -1,27 +1,31 @@
 #!/bin/bash
 
-# Abbruch bei Fehlern
 set -e
 
 echo "=== System aktualisieren ==="
 apt update
 apt upgrade -y
 
-echo "=== Pakete installieren ==="
-apt install -y curl git npm
+echo "=== Basis-Pakete installieren ==="
+apt install -y curl wget git npm
 
 echo "=== PM2 installieren ==="
 npm install -g pm2
 
 echo "=== Docker installieren ==="
-curl -fsSL https://get.docker.com -o get-docker.sh
+# Falls curl nicht verfügbar ist, fallback auf wget
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL https://get.docker.com -o get-docker.sh
+else
+    wget -q https://get.docker.com -O get-docker.sh
+fi
+
 sh get-docker.sh
 
 echo "=== User zu Docker-Gruppe hinzufügen ==="
 usermod -aG docker "$USER"
 
-echo "=== Gruppe neu laden (nur aktuelle Session) ==="
-# newgrp funktioniert in Skripten nicht sinnvoll → Hinweis ausgeben
-echo "Du musst dich einmal ab- und wieder anmelden, damit die Docker-Berechtigungen aktiv werden."
+echo "=== Hinweis: bitte einmal neu einloggen ==="
+echo "Docker-Gruppenrechte werden erst nach erneuter Anmeldung aktiv."
 
 echo "=== Setup abgeschlossen ==="
