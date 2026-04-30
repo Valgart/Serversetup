@@ -6,6 +6,12 @@ echo "=== System aktualisieren ==="
 apt update
 apt upgrade -y
 
+echo "=== Zeitzone auf Europa/Berlin setzen ==="
+# Setzt die Zeitzone non-interaktiv
+ln -fs /usr/share/zoneinfo/Europe/Berlin /etc/localtime
+echo "Europe/Berlin" > /etc/timezone
+dpkg-reconfigure -f noninteractive tzdata
+
 echo "=== Basis-Pakete installieren ==="
 apt install -y curl wget git npm
 
@@ -13,7 +19,6 @@ echo "=== PM2 installieren ==="
 npm install -g pm2
 
 echo "=== Docker installieren ==="
-# Falls curl nicht verfügbar ist, fallback auf wget
 if command -v curl >/dev/null 2>&1; then
     curl -fsSL https://get.docker.com -o get-docker.sh
 else
