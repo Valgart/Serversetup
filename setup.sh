@@ -17,11 +17,18 @@ echo "=== System aktualisieren ==="
 apt update
 apt upgrade -y
 
-echo "=== Zeitzone auf Europa/Berlin setzen ==="
-ln -fs /usr/share/zoneinfo/Europe/Berlin /etc/localtime
+echo "=== Zeitzone auf Europe/Berlin setzen ==="
+# 1. Symlink erzwingen
+ln -snf /usr/share/zoneinfo/Europe/Berlin /etc/localtime
 echo "Europe/Berlin" > /etc/timezone
-dpkg-reconfigure -f noninteractive tzdata
 
+# 2. Falls systemd aktiv ist (LXC-Standard), direkt via timedatectl setzen
+if command -v timedatectl >/dev/null 2>&1; then
+    timedatectl set-timezone Europe/Berlin || true
+fi
+
+# 3. tzdata non-interaktiv rekonfigurieren
+DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata
 echo "=== Basis-Pakete installieren ==="
 # git und btop werden immer installiert, curl/wget für Downloads benötigt
 apt install -y curl wget git btop
