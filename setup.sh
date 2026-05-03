@@ -4,12 +4,9 @@
 set -e
 
 # Ermitteln, ob ein normaler User existiert (für Docker/Samba Rechte)
-# Falls man als root via SSH eingeloggt ist, wird geschaut, wer der originale User war.
 REAL_USER=${SUDO_USER:-$USER}
 if [ "$REAL_USER" = "root" ]; then
-    # Falls kein sudo genutzt wurde, nehmen wir den ersten normalen User mit einer UID >= 1000
     REAL_USER=$(awk -F: '$3 >= 1000 && $3 != 65534 {print $1; exit}' /etc/passwd)
-    # Falls gar kein normaler User existiert, bleibt es bei root
     REAL_USER=${REAL_USER:-root}
 fi
 
@@ -18,19 +15,16 @@ apt update
 apt upgrade -y
 
 echo "=== Zeitzone auf Europe/Berlin setzen ==="
-# 1. Symlink erzwingen
 ln -snf /usr/share/zoneinfo/Europe/Berlin /etc/localtime
 echo "Europe/Berlin" > /etc/timezone
 
-# 2. Falls systemd aktiv ist (LXC-Standard), direkt via timedatectl setzen
 if command -v timedatectl >/dev/null 2>&1; then
     timedatectl set-timezone Europe/Berlin || true
 fi
 
-# 3. tzdata non-interaktiv rekonfigurieren
 DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata
+
 echo "=== Basis-Pakete installieren ==="
-# git und btop werden immer installiert, curl/wget für Downloads benötigt
 apt install -y curl wget git btop
 
 # --- Funktionen für die optionale Installation ---
@@ -49,18 +43,47 @@ install_docker() {
         wget -q https://get.docker.com -O get-docker.sh
     fi
     sh get-docker.sh
-    rm get-docker.sh
+    rm -f get-docker.sh
 
     if [ "$REAL_USER" != "root" ]; then
         echo "=== Füge Nutzer '$REAL_USER' zur Docker-Gruppe hinzu ==="
-        usermod -aG docker "$REAL_USER"
+        usermod -aG docker "$REAL_USER" || true
     fi
 }
 
 install_samba() {
     echo "=== Installiere Samba & WSDD ==="
-    apt install -y samba wsdd
+    apt install -y samba
     
+    # WSDD Installation via APT versuchen, sonst manuelles Fallback
+    echo "--> Installiere und starte WSDD..."
+    if apt install -y wsdd 2>/dev/null; then
+        systemctl enable wsdd || true
+        systemctl restart wsdd || true
+    else
+        echo "--> APT-Installation von wsdd fehlgeschlagen. Führe manuelles Setup durch..."
+        wget -qO /usr/local/bin/wsdd https://raw.githubusercontent.com/christgau/wsdd/master/src/wsdd.py
+        chmod +x /usr/local/bin/wsdd
+        
+        # Systemd Service für wsdd erstellen
+        cat <<EOT > /etc/systemd/system/wsdd.service
+[Unit]
+Description=Web Services Dynamic Discovery Host Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wsdd --shortlog
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOT
+        systemctl daemon-reload
+        systemctl enable wsdd
+        systemctl start wsdd
+    fi
+
     # Ordner erstellen
     SHARE_DIR="/shares/Daten"
     echo "--> Erstelle Freigabe-Ordner: $SHARE_DIR"
@@ -68,7 +91,7 @@ install_samba() {
     chmod 2775 "$SHARE_DIR"
     chown -R nobody:nogroup "$SHARE_DIR"
 
-    # Samba Konfiguration sichern und neu schreiben (inkl. Server Signing)
+    # Samba Konfiguration sichern und neu schreiben
     SMB_CONF="/etc/samba/smb.conf"
     if [ -f "$SMB_CONF" ]; then
         cp "$SMB_CONF" "${SMB_CONF}.bak"
@@ -103,15 +126,15 @@ EOT
     groupadd -f smbusers
     chgrp -R smbusers "$SHARE_DIR"
 
-    # Dienste aktivieren & starten
-    systemctl restart smbd nmbd wsdd
-    systemctl enable smbd nmbd wsdd
+    # Dienste aktivieren & starten (Fehler ignorieren, damit Skript weiterläuft)
+    systemctl restart smbd nmbd || true
+    systemctl enable smbd nmbd || true
 
-    # Abfrage für Samba-Nutzer
+    # Abfrage für Samba-Nutzer (Zwingend von /dev/tty lesen!)
     echo ""
-    read -p "Möchtest du jetzt einen Samba-Nutzer anlegen? (j/n): " create_user
+    read -p "Möchtest du jetzt einen Samba-Nutzer anlegen? (j/n): " create_user </dev/tty
     if [[ "$create_user" =~ ^[JjYy]$ ]]; then
-        read -p "Gib den gewünschten Benutzernamen ein: " smb_username
+        read -p "Gib den gewünschten Benutzernamen ein: " smb_username </dev/tty
         
         if id "$smb_username" &>/dev/null; then
             echo "Nutzer '$smb_username' existiert bereits im System."
@@ -121,6 +144,7 @@ EOT
 
         usermod -aG smbusers "$smb_username"
         echo "--> Bitte richte das Samba-Passwort für '$smb_username' ein:"
+        # smbpasswd liest nativ aus dem Terminal, das funktioniert problemlos
         smbpasswd -a "$smb_username"
         smbpasswd -e "$smb_username"
         
@@ -131,7 +155,7 @@ EOT
 }
 
 # --- Auswahl-Menü ---
-
+# Auch hier wird von /dev/tty gelesen, damit wget das Menü nicht überspringt!
 echo ""
 echo "================================================="
 echo " Bitte wähle die Zusatzpakete für die Installation:"
@@ -144,7 +168,7 @@ echo "5) Docker + Samba"
 echo "6) NPM + Docker + Samba"
 echo "7) Keine weiteren Pakete installieren"
 echo "================================================="
-read -p "Auswahl [1-7]: " choice
+read -p "Auswahl [1-7]: " choice </dev/tty
 
 case $choice in
     1)
@@ -180,5 +204,5 @@ esac
 echo ""
 echo "=== Setup erfolgreich abgeschlossen ==="
 if [ "$REAL_USER" != "root" ]; then
-    echo "Hinweis: Bitte einmal neu einloggen, damit neue Gruppenrechte (z.B. Docker) für '$REAL_USER' aktiv werden."
+    echo "Hinweis: Bitte einmal neu einloggen, damit neue Gruppenrechte für '$REAL_USER' aktiv werden."
 fi
