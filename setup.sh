@@ -3,7 +3,22 @@
 # Bei Fehlern, ungesetzten Variablen oder fehlgeschlagenen Pipes abbrechen
 set -euo pipefail
 
-# --- Root-Check ---
+# =============================================================================
+# Logging – alle Ausgaben gehen sowohl auf die Konsole als auch in die Logdatei
+# =============================================================================
+LOG_FILE="/var/log/setup.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo ""
+echo "=== Skript gestartet: $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+# =============================================================================
+# trap – saubere Fehlermeldung bei unerwartetem Abbruch
+# =============================================================================
+trap 'echo ""; echo "FEHLER: Skript abgebrochen in Zeile $LINENO (Exit-Code: $?). Siehe $LOG_FILE für Details." >&2' ERR
+
+# =============================================================================
+# Root-Check
+# =============================================================================
 if [ "$(id -u)" -ne 0 ]; then
     echo "FEHLER: Dieses Skript muss als root ausgeführt werden (sudo)." >&2
     exit 1
@@ -16,9 +31,49 @@ if [ "$REAL_USER" = "root" ]; then
     REAL_USER=${REAL_USER:-root}
 fi
 
+# =============================================================================
+# Installations-Status prüfen (für Update-Modus und Menü-Anzeige)
+# =============================================================================
+check_installed() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+is_npm_installed()    { check_installed npm; }
+is_pm2_installed()    { check_installed pm2; }
+is_docker_installed() { check_installed docker; }
+is_samba_installed()  { dpkg -l samba 2>/dev/null | grep -q '^ii'; }
+is_iperf3_installed() { check_installed iperf3; }
+
+# =============================================================================
+# Modus-Abfrage: Update-only oder vollständiges Setup
+# =============================================================================
+echo ""
+echo "================================================="
+echo " Was soll das Skript tun?"
+echo "================================================="
+echo "1) Vollständiges Setup (System + optionale Pakete)"
+echo "2) Nur System aktualisieren (apt update + upgrade)"
+echo "================================================="
+read -p "Auswahl [1-2]: " mode_choice </dev/tty
+
+if [[ "$mode_choice" == "2" ]]; then
+    echo ""
+    echo "=== System aktualisieren ==="
+    DEBIAN_FRONTEND=noninteractive apt update
+    DEBIAN_FRONTEND=noninteractive apt upgrade -y
+    echo ""
+    echo "=== System erfolgreich aktualisiert: $(date '+%Y-%m-%d %H:%M:%S') ==="
+    exit 0
+fi
+
+# =============================================================================
+# Ab hier: Vollständiges Setup
+# =============================================================================
+
+echo ""
 echo "=== System aktualisieren ==="
-apt update
-apt upgrade -y
+DEBIAN_FRONTEND=noninteractive apt update
+DEBIAN_FRONTEND=noninteractive apt upgrade -y
 
 echo "=== Zeitzone auf Europe/Berlin setzen ==="
 ln -snf /usr/share/zoneinfo/Europe/Berlin /etc/localtime
@@ -32,22 +87,59 @@ DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata
 
 echo "=== Basis-Pakete installieren ==="
 # btop bevorzugen, Fallback auf htop falls nicht im Repo verfügbar
-apt install -y curl wget git btop 2>/dev/null || {
+DEBIAN_FRONTEND=noninteractive apt install -y curl wget git btop 2>/dev/null || {
     echo "--> btop nicht verfügbar, installiere htop als Fallback..."
-    apt install -y curl wget git htop
+    DEBIAN_FRONTEND=noninteractive apt install -y curl wget git htop
 }
 
-# --- Funktionen für die optionale Installation ---
+# =============================================================================
+# unattended-upgrades – immer installieren und konfigurieren
+# =============================================================================
+echo "=== Installiere und konfiguriere unattended-upgrades ==="
+DEBIAN_FRONTEND=noninteractive apt install -y unattended-upgrades apt-listchanges
+
+# Automatische Sicherheitsupdates aktivieren
+cat <<'EOT' > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOT
+
+# Konfiguration: nur Security-Updates, Reboot nachts um 3 Uhr
+cat <<'EOT' > /etc/apt/apt.conf.d/50unattended-upgrades
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:00";
+EOT
+
+systemctl enable unattended-upgrades || true
+systemctl restart unattended-upgrades || true
+echo "--> unattended-upgrades konfiguriert (Security-Updates, Auto-Reboot 03:00 Uhr)"
+
+# =============================================================================
+# Installations-Funktionen
+# =============================================================================
 
 install_npm_pm2() {
     echo "=== Installiere NPM und PM2 ==="
-    apt install -y npm
+    DEBIAN_FRONTEND=noninteractive apt install -y npm
     # --unsafe-perm verhindert Berechtigungsprobleme in LXC/Container-Umgebungen
     npm install -g --unsafe-perm pm2
 }
 
 install_docker() {
     echo "=== Installiere Docker ==="
+    if is_docker_installed; then
+        echo "--> Docker ist bereits installiert, überspringe..."
+        return
+    fi
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL https://get.docker.com -o get-docker.sh
     else
@@ -62,9 +154,14 @@ install_docker() {
     fi
 }
 
+install_iperf3() {
+    echo "=== Installiere iperf3 ==="
+    DEBIAN_FRONTEND=noninteractive apt install -y iperf3
+}
+
 install_samba() {
     echo "=== Installiere Samba & WSDD ==="
-    apt install -y samba
+    DEBIAN_FRONTEND=noninteractive apt install -y samba
 
     # --- Pfad-Abfrage ---
     echo ""
@@ -85,7 +182,7 @@ install_samba() {
 
     # WSDD Installation via APT versuchen, sonst manuelles Fallback
     echo "--> Installiere und starte WSDD..."
-    if apt install -y wsdd 2>/dev/null; then
+    if DEBIAN_FRONTEND=noninteractive apt install -y wsdd 2>/dev/null; then
         systemctl enable wsdd || true
         systemctl restart wsdd || true
     else
@@ -164,7 +261,6 @@ EOT
         if id "$smb_username" &>/dev/null; then
             echo "Nutzer '$smb_username' existiert bereits im System."
         else
-            # /usr/sbin/nologin ist auf Debian/Ubuntu zuverlässig vorhanden
             useradd -m -s /usr/sbin/nologin "$smb_username"
         fi
 
@@ -182,30 +278,47 @@ EOT
     SAMBA_SHARE_DIR="$SHARE_DIR"
 }
 
-# --- Auswahl-Menü ---
+# =============================================================================
+# Installations-Status ermitteln und Menü aufbauen
+# =============================================================================
+label_npm=""
+label_docker=""
+label_samba=""
+label_iperf3=""
+
+is_npm_installed    && is_pm2_installed    && label_npm="    [bereits installiert]" || label_npm=""
+is_docker_installed                        && label_docker=" [bereits installiert]" || label_docker=""
+is_samba_installed                         && label_samba="  [bereits installiert]" || label_samba=""
+is_iperf3_installed                        && label_iperf3=" [bereits installiert]" || label_iperf3=""
+
 echo ""
 echo "================================================="
 echo " Bitte wähle die Zusatzpakete für die Installation:"
+echo " (Bereits installierte Pakete werden übersprungen)"
 echo "================================================="
-echo "1) Nur NPM + PM2"
-echo "2) Nur Docker"
-echo "3) Nur Samba"
-echo "4) NPM + Docker"
-echo "5) Docker + Samba"
-echo "6) NPM + Docker + Samba"
-echo "7) Keine weiteren Pakete installieren"
+echo "1) Nur NPM + PM2          $label_npm"
+echo "2) Nur Docker             $label_docker"
+echo "3) Nur Samba              $label_samba"
+echo "4) Nur iperf3             $label_iperf3"
+echo "5) NPM + Docker           $label_npm $label_docker"
+echo "6) Docker + Samba         $label_docker $label_samba"
+echo "7) NPM + Docker + Samba   $label_npm $label_docker $label_samba"
+echo "8) Alles (inkl. iperf3)   $label_npm $label_docker $label_samba $label_iperf3"
+echo "9) Keine weiteren Pakete installieren"
 echo "================================================="
-read -p "Auswahl [1-7]: " choice </dev/tty
+read -p "Auswahl [1-9]: " choice </dev/tty
 
 # Auswahl bestätigen lassen
 case $choice in
     1) choice_label="NPM + PM2" ;;
     2) choice_label="Docker" ;;
     3) choice_label="Samba" ;;
-    4) choice_label="NPM + PM2 + Docker" ;;
-    5) choice_label="Docker + Samba" ;;
-    6) choice_label="NPM + PM2 + Docker + Samba" ;;
-    7) choice_label="Keine weiteren Pakete" ;;
+    4) choice_label="iperf3" ;;
+    5) choice_label="NPM + PM2 + Docker" ;;
+    6) choice_label="Docker + Samba" ;;
+    7) choice_label="NPM + PM2 + Docker + Samba" ;;
+    8) choice_label="Alles (NPM + PM2 + Docker + Samba + iperf3)" ;;
+    9) choice_label="Keine weiteren Pakete" ;;
     *) choice_label="Ungültige Auswahl" ;;
 esac
 
@@ -219,44 +332,56 @@ fi
 
 SAMBA_SHARE_DIR=""
 
+# Bereits installierte Pakete überspringen mit Hinweis
+maybe_install_npm_pm2() {
+    if is_npm_installed && is_pm2_installed; then
+        echo "--> NPM + PM2 bereits installiert, überspringe..."
+    else
+        install_npm_pm2
+    fi
+}
+
+maybe_install_samba() {
+    if is_samba_installed; then
+        echo "--> Samba bereits installiert, überspringe..."
+    else
+        install_samba
+    fi
+}
+
+maybe_install_iperf3() {
+    if is_iperf3_installed; then
+        echo "--> iperf3 bereits installiert, überspringe..."
+    else
+        install_iperf3
+    fi
+}
+
 case $choice in
-    1)
-        install_npm_pm2
-        ;;
-    2)
-        install_docker
-        ;;
-    3)
-        install_samba
-        ;;
-    4)
-        install_npm_pm2
-        install_docker
-        ;;
-    5)
-        install_docker
-        install_samba
-        ;;
-    6)
-        install_npm_pm2
-        install_docker
-        install_samba
-        ;;
-    7)
-        echo "Keine Zusatzpakete ausgewählt."
-        ;;
-    *)
-        echo "Ungültige Auswahl. Überspringe Zusatzinstallationen."
-        ;;
+    1) maybe_install_npm_pm2 ;;
+    2) install_docker ;;
+    3) maybe_install_samba ;;
+    4) maybe_install_iperf3 ;;
+    5) maybe_install_npm_pm2; install_docker ;;
+    6) install_docker; maybe_install_samba ;;
+    7) maybe_install_npm_pm2; install_docker; maybe_install_samba ;;
+    8) maybe_install_npm_pm2; install_docker; maybe_install_samba; maybe_install_iperf3 ;;
+    9) echo "Keine Zusatzpakete ausgewählt." ;;
+    *) echo "Ungültige Auswahl. Überspringe Zusatzinstallationen." ;;
 esac
 
+# =============================================================================
+# Abschlussmeldung
+# =============================================================================
 echo ""
 echo "=========================================="
 echo "=== Setup erfolgreich abgeschlossen    ==="
+echo "=== $(date '+%Y-%m-%d %H:%M:%S')        ==="
 echo "=========================================="
 if [ -n "$SAMBA_SHARE_DIR" ]; then
-    echo "  Samba-Freigabe:  $SAMBA_SHARE_DIR"
+    echo "  Samba-Freigabe:        $SAMBA_SHARE_DIR"
 fi
+echo "  Log gespeichert unter: $LOG_FILE"
 if [ "$REAL_USER" != "root" ]; then
     echo "  Hinweis: Bitte einmal neu einloggen,"
     echo "  damit neue Gruppenrechte für '$REAL_USER' aktiv werden."
