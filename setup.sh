@@ -54,7 +54,25 @@ install_docker() {
 install_samba() {
     echo "=== Installiere Samba & WSDD ==="
     apt install -y samba
-    
+
+    # --- Pfad-Abfrage ---
+    echo ""
+    echo "Wo soll der Samba-Freigabe-Ordner erstellt werden?"
+    echo "  Standard: /shares/Daten"
+    read -p "Eigenen Pfad angeben? (j/n): " custom_path_choice </dev/tty
+    if [[ "$custom_path_choice" =~ ^[JjYy]$ ]]; then
+        read -p "Vollständigen Pfad eingeben (z.B. /mnt/internal/Daten): " SHARE_DIR </dev/tty
+        # Leerzeichen und leere Eingabe abfangen
+        SHARE_DIR=$(echo "$SHARE_DIR" | xargs)
+        if [ -z "$SHARE_DIR" ]; then
+            echo "Kein Pfad eingegeben. Verwende Standard: /shares/Daten"
+            SHARE_DIR="/shares/Daten"
+        fi
+    else
+        SHARE_DIR="/shares/Daten"
+    fi
+    echo "--> Verwende Freigabe-Pfad: $SHARE_DIR"
+
     # WSDD Installation via APT versuchen, sonst manuelles Fallback
     echo "--> Installiere und starte WSDD..."
     if apt install -y wsdd 2>/dev/null; then
@@ -64,8 +82,7 @@ install_samba() {
         echo "--> APT-Installation von wsdd fehlgeschlagen. Führe manuelles Setup durch..."
         wget -qO /usr/local/bin/wsdd https://raw.githubusercontent.com/christgau/wsdd/master/src/wsdd.py
         chmod +x /usr/local/bin/wsdd
-        
-        # Systemd Service für wsdd erstellen
+
         cat <<EOT > /etc/systemd/system/wsdd.service
 [Unit]
 Description=Web Services Dynamic Discovery Host Daemon
@@ -85,7 +102,6 @@ EOT
     fi
 
     # Ordner erstellen
-    SHARE_DIR="/shares/Daten"
     echo "--> Erstelle Freigabe-Ordner: $SHARE_DIR"
     mkdir -p "$SHARE_DIR"
     chmod 2775 "$SHARE_DIR"
@@ -126,16 +142,16 @@ EOT
     groupadd -f smbusers
     chgrp -R smbusers "$SHARE_DIR"
 
-    # Dienste aktivieren & starten (Fehler ignorieren, damit Skript weiterläuft)
+    # Dienste aktivieren & starten
     systemctl restart smbd nmbd || true
     systemctl enable smbd nmbd || true
 
-    # Abfrage für Samba-Nutzer (Zwingend von /dev/tty lesen!)
+    # Abfrage für Samba-Nutzer
     echo ""
     read -p "Möchtest du jetzt einen Samba-Nutzer anlegen? (j/n): " create_user </dev/tty
     if [[ "$create_user" =~ ^[JjYy]$ ]]; then
         read -p "Gib den gewünschten Benutzernamen ein: " smb_username </dev/tty
-        
+
         if id "$smb_username" &>/dev/null; then
             echo "Nutzer '$smb_username' existiert bereits im System."
         else
@@ -144,10 +160,9 @@ EOT
 
         usermod -aG smbusers "$smb_username"
         echo "--> Bitte richte das Samba-Passwort für '$smb_username' ein:"
-        # smbpasswd liest nativ aus dem Terminal, das funktioniert problemlos
         smbpasswd -a "$smb_username"
         smbpasswd -e "$smb_username"
-        
+
         chown -R :smbusers "$SHARE_DIR"
         chmod -R g+rwx "$SHARE_DIR"
         echo "=== Samba-Benutzer '$smb_username' erfolgreich angelegt. ==="
@@ -155,7 +170,6 @@ EOT
 }
 
 # --- Auswahl-Menü ---
-# Auch hier wird von /dev/tty gelesen, damit wget das Menü nicht überspringt!
 echo ""
 echo "================================================="
 echo " Bitte wähle die Zusatzpakete für die Installation:"
