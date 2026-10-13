@@ -83,11 +83,12 @@ if (exec </dev/tty) 2>/dev/null; then HAS_TTY=1; fi
 
 # ask "Prompt" VARNAME [Default]
 ask() {
-    local prompt=$1 var=$2 default=${3:-} reply=""
+    # Lokale Namen mit Unterstrich, damit sie nie mit dem Ziel-Variablennamen kollidieren
+    local _prompt=$1 _var=$2 _default=${3:-} _input=""
     if [ "$HAS_TTY" -eq 1 ]; then
-        read -rp "$prompt" reply </dev/tty || true
+        read -rp "$_prompt" _input </dev/tty || true
     fi
-    printf -v "$var" '%s' "${reply:-$default}"
+    printf -v "$_var" '%s' "${_input:-$_default}"
 }
 
 # confirm "Frage" -> Exit 0 bei "ja"; ohne TTY nur mit --yes
