@@ -1,389 +1,512 @@
-#!/bin/bash
-
-# Bei Fehlern, ungesetzten Variablen oder fehlgeschlagenen Pipes abbrechen
-set -euo pipefail
-
+#!/usr/bin/env bash
 # =============================================================================
-# Logging – alle Ausgaben gehen sowohl auf die Konsole als auch in die Logdatei
+# Ubuntu Server Setup
+#
+# Interaktiv:       sudo ./setup.sh
+# Nur Updates:      sudo ./setup.sh --update-only
+# Nicht-interaktiv: sudo ./setup.sh --yes --install docker,samba,ufw
+#
+# Getestet gedacht für Ubuntu 22.04 / 24.04 (VM und LXC).
 # =============================================================================
+
+# -E: ERR-Trap auch in Funktionen, -e/-u/-o pipefail: bei Fehlern abbrechen
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
 LOG_FILE="/var/log/setup.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
-echo ""
-echo "=== Skript gestartet: $(date '+%Y-%m-%d %H:%M:%S') ==="
+APT_OPTS=(-y -o 'Dpkg::Options::=--force-confdef' -o 'Dpkg::Options::=--force-confold')
 
-# =============================================================================
-# trap – saubere Fehlermeldung bei unerwartetem Abbruch
-# =============================================================================
-trap 'echo ""; echo "FEHLER: Skript abgebrochen in Zeile $LINENO (Exit-Code: $?). Siehe $LOG_FILE für Details." >&2' ERR
+# -----------------------------------------------------------------------------
+# Argumente
+# -----------------------------------------------------------------------------
+ASSUME_YES=0
+UPDATE_ONLY=0
+INSTALL_LIST=""
+SAMBA_PATH_ARG=""
+SAMBA_USER_ARG=""
 
-# =============================================================================
+usage() {
+    cat <<'EOT'
+Verwendung: setup.sh [Optionen]
+
+  -y, --yes               Rückfragen automatisch mit "ja" beantworten
+      --update-only       Nur apt update/upgrade/autoremove ausführen
+      --install LISTE     Komma-getrennt: nodejs,docker,samba,iperf3,fail2ban,ufw,ssh
+                          (ssh = SSH-Härtung, ufw = Firewall)
+      --samba-path PFAD   Samba-Freigabepfad (Standard: /shares/Daten)
+      --samba-user NAME   Samba-Nutzer anlegen (Passwort danach: smbpasswd -a NAME)
+  -h, --help              Diese Hilfe
+EOT
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -y|--yes)       ASSUME_YES=1 ;;
+        --update-only)  UPDATE_ONLY=1 ;;
+        --install)      INSTALL_LIST="${2:?--install benötigt eine Liste}"; shift ;;
+        --samba-path)   SAMBA_PATH_ARG="${2:?--samba-path benötigt einen Pfad}"; shift ;;
+        --samba-user)   SAMBA_USER_ARG="${2:?--samba-user benötigt einen Namen}"; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              echo "Unbekannte Option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# -----------------------------------------------------------------------------
 # Root-Check
-# =============================================================================
+# -----------------------------------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
     echo "FEHLER: Dieses Skript muss als root ausgeführt werden (sudo)." >&2
     exit 1
 fi
 
-# Ermitteln, ob ein normaler User existiert (für Docker/Samba Rechte)
-REAL_USER=${SUDO_USER:-$USER}
+# -----------------------------------------------------------------------------
+# Logging – Konsole + Logdatei (Logdatei nur für root lesbar)
+# -----------------------------------------------------------------------------
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo ""
+echo "=== Skript gestartet: $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+trap 'rc=$?; echo ""; echo "FEHLER: Skript abgebrochen in Zeile $LINENO (Exit-Code: $rc). Siehe $LOG_FILE" >&2' ERR
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktionen
+# -----------------------------------------------------------------------------
+die()  { echo "FEHLER: $*" >&2; exit 1; }
+warn() { echo "WARNUNG: $*" >&2; }
+
+# Gibt es ein Terminal für Rückfragen? (auch bei curl | bash)
+HAS_TTY=0
+if (exec </dev/tty) 2>/dev/null; then HAS_TTY=1; fi
+
+# ask "Prompt" VARNAME [Default]
+ask() {
+    local prompt=$1 var=$2 default=${3:-} reply=""
+    if [ "$HAS_TTY" -eq 1 ]; then
+        read -rp "$prompt" reply </dev/tty || true
+    fi
+    printf -v "$var" '%s' "${reply:-$default}"
+}
+
+# confirm "Frage" -> Exit 0 bei "ja"; ohne TTY nur mit --yes
+confirm() {
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    [ "$HAS_TTY" -eq 1 ] || return 1
+    local r=""
+    read -rp "$1 (j/n): " r </dev/tty || return 1
+    [[ "$r" =~ ^[JjYy]$ ]]
+}
+
+apt_install() { apt-get install "${APT_OPTS[@]}" "$@"; }
+
+# Normalen User ermitteln (für Docker-Gruppe, PM2, SSH-Check)
+REAL_USER=${SUDO_USER:-${USER:-root}}
 if [ "$REAL_USER" = "root" ]; then
     REAL_USER=$(awk -F: '$3 >= 1000 && $3 != 65534 {print $1; exit}' /etc/passwd)
     REAL_USER=${REAL_USER:-root}
 fi
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 
-# =============================================================================
-# Installations-Status prüfen (für Update-Modus und Menü-Anzeige)
-# =============================================================================
-check_installed() {
-    command -v "$1" >/dev/null 2>&1
+check_installed()     { command -v "$1" >/dev/null 2>&1; }
+is_node_ready()       { check_installed node && check_installed pm2; }
+is_docker_installed() { check_installed docker; }
+is_iperf3_installed() { check_installed iperf3; }
+is_fail2ban_installed() { check_installed fail2ban-client; }
+is_ufw_active()       { check_installed ufw && ufw status 2>/dev/null | grep -q '^Status: active'; }
+is_samba_installed()  { [ "$(dpkg-query -W -f='${Status}' samba 2>/dev/null)" = "install ok installed" ]; }
+label()               { "$@" && printf ' [bereits installiert]' || true; }
+
+do_update() {
+    echo "=== System aktualisieren ==="
+    apt-get update
+    apt-get "${APT_OPTS[@]}" upgrade
+    apt-get -y autoremove
 }
 
-is_npm_installed()    { check_installed npm; }
-is_pm2_installed()    { check_installed pm2; }
-is_docker_installed() { check_installed docker; }
-is_samba_installed()  { dpkg -l samba 2>/dev/null | grep -q '^ii'; }
-is_iperf3_installed() { check_installed iperf3; }
+reboot_hint() {
+    if [ -f /var/run/reboot-required ]; then
+        echo ""
+        echo ">>> Neustart erforderlich (/var/run/reboot-required vorhanden)."
+    fi
+}
 
-# =============================================================================
-# Modus-Abfrage: Update-only oder vollständiges Setup
-# =============================================================================
-echo ""
-echo "================================================="
-echo " Was soll das Skript tun?"
-echo "================================================="
-echo "1) Vollständiges Setup (System + optionale Pakete)"
-echo "2) Nur System aktualisieren (apt update + upgrade)"
-echo "================================================="
-read -p "Auswahl [1-2]: " mode_choice </dev/tty
-
-if [[ "$mode_choice" == "2" ]]; then
+# -----------------------------------------------------------------------------
+# Modus: Update-only oder vollständiges Setup
+# -----------------------------------------------------------------------------
+if [ "$UPDATE_ONLY" -eq 0 ] && [ -z "$INSTALL_LIST" ] && [ "$HAS_TTY" -eq 1 ]; then
     echo ""
-    echo "=== System aktualisieren ==="
-    DEBIAN_FRONTEND=noninteractive apt update
-    DEBIAN_FRONTEND=noninteractive apt upgrade -y
+    echo "================================================="
+    echo " Was soll das Skript tun?"
+    echo "================================================="
+    echo "1) Vollständiges Setup (System + optionale Pakete)"
+    echo "2) Nur System aktualisieren (apt update + upgrade)"
+    echo "================================================="
+    ask "Auswahl [1-2]: " mode_choice "1"
+    [ "$mode_choice" = "2" ] && UPDATE_ONLY=1
+fi
+
+if [ "$UPDATE_ONLY" -eq 1 ]; then
+    do_update
+    reboot_hint
     echo ""
     echo "=== System erfolgreich aktualisiert: $(date '+%Y-%m-%d %H:%M:%S') ==="
     exit 0
 fi
 
-# =============================================================================
-# Ab hier: Vollständiges Setup
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Auswahl der Zusatzkomponenten (Mehrfachauswahl, Validierung VOR der Bestätigung)
+# -----------------------------------------------------------------------------
+declare -A SEL=()
+ALL_PACKAGES=(nodejs docker samba iperf3 fail2ban)
 
-echo ""
-echo "=== System aktualisieren ==="
-DEBIAN_FRONTEND=noninteractive apt update
-DEBIAN_FRONTEND=noninteractive apt upgrade -y
-
-echo "=== Zeitzone auf Europe/Berlin setzen ==="
-ln -snf /usr/share/zoneinfo/Europe/Berlin /etc/localtime
-echo "Europe/Berlin" > /etc/timezone
-
-if command -v timedatectl >/dev/null 2>&1; then
-    timedatectl set-timezone Europe/Berlin || true
-fi
-
-DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata
-
-echo "=== Basis-Pakete installieren ==="
-# btop bevorzugen, Fallback auf htop falls nicht im Repo verfügbar
-DEBIAN_FRONTEND=noninteractive apt install -y curl wget git btop 2>/dev/null || {
-    echo "--> btop nicht verfügbar, installiere htop als Fallback..."
-    DEBIAN_FRONTEND=noninteractive apt install -y curl wget git htop
+parse_selection() {
+    local tok item input=${1//,/ }
+    for tok in $input; do
+        case "${tok,,}" in
+            1|nodejs|npm|pm2) item=nodejs ;;
+            2|docker)         item=docker ;;
+            3|samba)          item=samba ;;
+            4|iperf3)         item=iperf3 ;;
+            5|fail2ban)       item=fail2ban ;;
+            6|ufw)            item=ufw ;;
+            7|ssh)            item=ssh ;;
+            a|alle|all)       for item in "${ALL_PACKAGES[@]}"; do SEL[$item]=1; done; continue ;;
+            0|keine|none)     continue ;;
+            *) echo "Ungültige Auswahl: '$tok'" >&2; return 1 ;;
+        esac
+        SEL[$item]=1
+    done
 }
 
-# =============================================================================
-# unattended-upgrades – immer installieren und konfigurieren
-# =============================================================================
-echo "=== Installiere und konfiguriere unattended-upgrades ==="
-DEBIAN_FRONTEND=noninteractive apt install -y unattended-upgrades apt-listchanges
+if [ -n "$INSTALL_LIST" ]; then
+    parse_selection "$INSTALL_LIST" || die "Ungültige Liste für --install."
+elif [ "$HAS_TTY" -eq 1 ]; then
+    echo ""
+    echo "================================================="
+    echo " Zusatzkomponenten wählen (Mehrfachauswahl, z.B. '2 3 6')"
+    echo "================================================="
+    echo "1) Node.js (LTS) + PM2$(label is_node_ready)"
+    echo "2) Docker (offizielles apt-Repo)$(label is_docker_installed)"
+    echo "3) Samba$(label is_samba_installed)"
+    echo "4) iperf3$(label is_iperf3_installed)"
+    echo "5) fail2ban$(label is_fail2ban_installed)"
+    echo "6) Firewall (ufw)$(label is_ufw_active)"
+    echo "7) SSH-Härtung (nur Key-Login, kein Root-Login)"
+    echo "a) Alle Pakete (1-5, ohne Firewall/SSH-Härtung)"
+    echo "0) Nichts weiter installieren"
+    echo "================================================="
+    while true; do
+        ask "Auswahl: " reply "0"
+        if parse_selection "$reply"; then break; fi
+        SEL=()
+    done
+fi
 
-# Automatische Sicherheitsupdates aktivieren
-cat <<'EOT' > /etc/apt/apt.conf.d/20auto-upgrades
+if [ "${#SEL[@]}" -gt 0 ]; then
+    echo ""
+    echo "--> Gewählt: ${!SEL[*]}"
+    confirm "Fortfahren?" || { echo "Abgebrochen. (Ohne Terminal: --yes verwenden.)"; exit 0; }
+else
+    echo "--> Keine Zusatzkomponenten gewählt."
+fi
+
+# =============================================================================
+# Basis-Setup
+# =============================================================================
+do_update
+
+echo "=== Zeitzone auf Europe/Berlin setzen ==="
+set_timezone() {
+    if [ -d /run/systemd/system ] && timedatectl set-timezone Europe/Berlin 2>/dev/null; then
+        return 0
+    fi
+    # Fallback ohne systemd (z.B. manche Container)
+    ln -snf /usr/share/zoneinfo/Europe/Berlin /etc/localtime
+    echo "Europe/Berlin" > /etc/timezone
+}
+apt_install tzdata
+set_timezone
+
+echo "=== Basis-Pakete installieren ==="
+apt_install curl wget git ca-certificates
+apt_install btop || { echo "--> btop nicht verfügbar, installiere htop..."; apt_install htop; }
+
+echo "=== unattended-upgrades konfigurieren ==="
+apt_install unattended-upgrades apt-listchanges
+
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOT'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOT
 
-# Konfiguration: nur Security-Updates, Reboot nachts um 3 Uhr
-cat <<'EOT' > /etc/apt/apt.conf.d/50unattended-upgrades
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}-security";
-    "${distro_id}ESMApps:${distro_codename}-apps-security";
-    "${distro_id}ESM:${distro_codename}-infra-security";
-};
+# Drop-in statt Überschreiben der Hauptdatei: Ubuntu-Defaults (Security-Origins)
+# bleiben erhalten, eigene Änderungen an 50unattended-upgrades auch.
+cat > /etc/apt/apt.conf.d/51local-unattended <<'EOT'
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
 Unattended-Upgrade::Automatic-Reboot-Time "03:00";
 EOT
 
-systemctl enable unattended-upgrades || true
-systemctl restart unattended-upgrades || true
-echo "--> unattended-upgrades konfiguriert (Security-Updates, Auto-Reboot 03:00 Uhr)"
+systemctl enable --now unattended-upgrades || true
+echo "--> Security-Updates aktiv, Auto-Reboot 03:00 Uhr (nur wenn niemand eingeloggt ist)"
 
 # =============================================================================
 # Installations-Funktionen
 # =============================================================================
+SAMBA_SHARE_DIR=""
+ADDED_TO_DOCKER_GROUP=0
 
-install_npm_pm2() {
-    echo "=== Installiere NPM und PM2 ==="
-    DEBIAN_FRONTEND=noninteractive apt install -y npm
-    # --unsafe-perm verhindert Berechtigungsprobleme in LXC/Container-Umgebungen
-    npm install -g --unsafe-perm pm2
+install_nodejs() {
+    echo "=== Installiere Node.js (LTS) + PM2 ==="
+    if ! check_installed node; then
+        local tmp
+        tmp=$(mktemp)
+        curl -fsSL https://deb.nodesource.com/setup_lts.x -o "$tmp"
+        bash "$tmp"
+        rm -f "$tmp"
+        apt_install nodejs
+    else
+        echo "--> Node.js bereits vorhanden ($(node --version)), überspringe NodeSource."
+    fi
+
+    if ! check_installed pm2; then
+        npm install -g pm2
+    fi
+
+    echo "--> Richte PM2-Autostart für '$REAL_USER' ein..."
+    pm2 startup systemd -u "$REAL_USER" --hp "$REAL_HOME" \
+        || warn "pm2 startup fehlgeschlagen – manuell prüfen."
+    echo "--> Hinweis: Nach dem Starten deiner Apps als '$REAL_USER' einmal 'pm2 save' ausführen."
 }
 
 install_docker() {
-    echo "=== Installiere Docker ==="
+    echo "=== Installiere Docker (offizielles apt-Repo) ==="
     if is_docker_installed; then
         echo "--> Docker ist bereits installiert, überspringe..."
         return
     fi
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL https://get.docker.com -o get-docker.sh
-    else
-        wget -q https://get.docker.com -O get-docker.sh
-    fi
-    sh get-docker.sh
-    rm -f get-docker.sh
+
+    local codename arch
+    codename=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}")
+    [ -n "$codename" ] || die "Konnte Ubuntu-Codename nicht ermitteln."
+    arch=$(dpkg --print-architecture)
+
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    echo "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${codename} stable" \
+        > /etc/apt/sources.list.d/docker.list
+
+    apt-get update
+    apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    systemctl enable --now docker || true
 
     if [ "$REAL_USER" != "root" ]; then
-        echo "=== Füge Nutzer '$REAL_USER' zur Docker-Gruppe hinzu ==="
-        usermod -aG docker "$REAL_USER" || true
+        usermod -aG docker "$REAL_USER"
+        ADDED_TO_DOCKER_GROUP=1
+        echo "--> '$REAL_USER' zur Gruppe 'docker' hinzugefügt (Achtung: faktisch root-äquivalent)."
     fi
 }
 
 install_iperf3() {
     echo "=== Installiere iperf3 ==="
-    DEBIAN_FRONTEND=noninteractive apt install -y iperf3
+    apt_install iperf3
+}
+
+install_fail2ban() {
+    echo "=== Installiere fail2ban ==="
+    apt_install fail2ban
+    systemctl enable --now fail2ban || true
+    echo "--> Ubuntu-Standard: sshd-Jail ist aktiv."
 }
 
 install_samba() {
-    echo "=== Installiere Samba & WSDD ==="
-    DEBIAN_FRONTEND=noninteractive apt install -y samba
+    echo "=== Installiere Samba & wsdd ==="
+    apt_install samba
 
-    # --- Pfad-Abfrage ---
-    echo ""
-    echo "Wo soll der Samba-Freigabe-Ordner erstellt werden?"
-    echo "  Standard: /shares/Daten"
-    read -p "Eigenen Pfad angeben? (j/n): " custom_path_choice </dev/tty
-    if [[ "$custom_path_choice" =~ ^[JjYy]$ ]]; then
-        read -p "Vollständigen Pfad eingeben (z.B. /mnt/internal/Daten): " SHARE_DIR </dev/tty
-        SHARE_DIR=$(echo "$SHARE_DIR" | xargs)
-        if [ -z "$SHARE_DIR" ]; then
-            echo "Kein Pfad eingegeben. Verwende Standard: /shares/Daten"
-            SHARE_DIR="/shares/Daten"
-        fi
+    if apt_install wsdd; then
+        systemctl enable --now wsdd || true
     else
-        SHARE_DIR="/shares/Daten"
-    fi
-    echo "--> Verwende Freigabe-Pfad: $SHARE_DIR"
-
-    # WSDD Installation via APT versuchen, sonst manuelles Fallback
-    echo "--> Installiere und starte WSDD..."
-    if DEBIAN_FRONTEND=noninteractive apt install -y wsdd 2>/dev/null; then
-        systemctl enable wsdd || true
-        systemctl restart wsdd || true
-    else
-        echo "--> APT-Installation von wsdd fehlgeschlagen. Führe manuelles Setup durch..."
-        wget -qO /usr/local/bin/wsdd https://raw.githubusercontent.com/christgau/wsdd/master/src/wsdd.py
-        chmod +x /usr/local/bin/wsdd
-
-        cat <<EOT > /etc/systemd/system/wsdd.service
-[Unit]
-Description=Web Services Dynamic Discovery Host Daemon
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/wsdd --shortlog
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOT
-        systemctl daemon-reload
-        systemctl enable wsdd
-        systemctl start wsdd
+        warn "wsdd nicht verfügbar – Windows-Netzwerkumgebung findet den Server evtl. nicht automatisch."
     fi
 
-    # Ordner erstellen und Rechte setzen
-    echo "--> Erstelle Freigabe-Ordner: $SHARE_DIR"
-    mkdir -p "$SHARE_DIR"
+    # --- Freigabepfad ---
+    local SHARE_DIR="${SAMBA_PATH_ARG:-}"
+    if [ -z "$SHARE_DIR" ]; then
+        ask "Samba-Freigabepfad [/shares/Daten]: " SHARE_DIR "/shares/Daten"
+    fi
+    SHARE_DIR="${SHARE_DIR%/}"
+    [[ "$SHARE_DIR" == /* ]] || die "Samba-Pfad muss absolut sein: '$SHARE_DIR'"
+    echo "--> Freigabe-Pfad: $SHARE_DIR"
 
-    # Gruppe erstellen, Ordner zuweisen und Berechtigungen setzen
+    # Nur das Top-Level-Verzeichnis anfassen, vorhandene Daten bleiben unberührt
     groupadd -f smbusers
+    mkdir -p "$SHARE_DIR"
     chown root:smbusers "$SHARE_DIR"
     chmod 2775 "$SHARE_DIR"
 
-    # Samba Konfiguration sichern und neu schreiben
-    SMB_CONF="/etc/samba/smb.conf"
-    if [ -f "$SMB_CONF" ]; then
+    # --- smb.conf (Backup nur einmalig, Original bleibt erhalten) ---
+    local SMB_CONF="/etc/samba/smb.conf"
+    if [ -f "$SMB_CONF" ] && [ ! -f "${SMB_CONF}.bak" ]; then
         cp "$SMB_CONF" "${SMB_CONF}.bak"
     fi
 
-    echo "--> Erstelle Samba-Konfiguration..."
-    cat <<EOT > "$SMB_CONF"
+    local NB_NAME
+    NB_NAME=$(hostname -s | cut -c1-15)
+
+    cat > "$SMB_CONF" <<EOT
+# Von setup.sh erzeugt
 [global]
    workgroup = WORKGROUP
    server string = Samba Server %v
-   netbios name = $(hostname)
+   netbios name = ${NB_NAME}
    security = user
-   map to guest = bad user
+   map to guest = never
    dns proxy = no
 
-   # Server Signing erzwingen
-   server signing = required
-   server min protocol = SMB2
+   server signing = mandatory
+   server min protocol = SMB3
 
 [Daten]
-   path = $SHARE_DIR
+   path = ${SHARE_DIR}
    browsable = yes
-   writable = yes
-   guest ok = no
    read only = no
+   guest ok = no
    force create mode = 0660
    force directory mode = 0770
    valid users = @smbusers
 EOT
 
-    # Dienste aktivieren & starten
+    if ! testparm -s "$SMB_CONF" >/dev/null 2>&1; then
+        [ -f "${SMB_CONF}.bak" ] && cp "${SMB_CONF}.bak" "$SMB_CONF"
+        die "smb.conf ungültig – Original wiederhergestellt."
+    fi
+
     systemctl enable smbd nmbd || true
     systemctl restart smbd nmbd || true
 
-    # Abfrage für Samba-Nutzer
-    echo ""
-    read -p "Möchtest du jetzt einen Samba-Nutzer anlegen? (j/n): " create_user </dev/tty
-    if [[ "$create_user" =~ ^[JjYy]$ ]]; then
-        read -p "Gib den gewünschten Benutzernamen ein: " smb_username </dev/tty
-
-        if id "$smb_username" &>/dev/null; then
-            echo "Nutzer '$smb_username' existiert bereits im System."
-        else
-            useradd -m -s /usr/sbin/nologin "$smb_username"
-        fi
-
-        usermod -aG smbusers "$smb_username"
-        echo "--> Bitte richte das Samba-Passwort für '$smb_username' ein:"
-        smbpasswd -a "$smb_username"
-        smbpasswd -e "$smb_username"
-
-        chown -R root:smbusers "$SHARE_DIR"
-        chmod -R g+rwx "$SHARE_DIR"
-        echo "=== Samba-Benutzer '$smb_username' erfolgreich angelegt. ==="
+    # --- Samba-Nutzer ---
+    local smb_username="${SAMBA_USER_ARG:-}"
+    if [ -z "$smb_username" ] && [ "$HAS_TTY" -eq 1 ] && confirm "Jetzt einen Samba-Nutzer anlegen?"; then
+        ask "Benutzername: " smb_username ""
     fi
 
-    # Gewählten Pfad für die Abschlussmeldung merken
+    if [ -n "$smb_username" ]; then
+        [[ "$smb_username" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "Ungültiger Benutzername: '$smb_username'"
+
+        if id "$smb_username" &>/dev/null; then
+            echo "--> Nutzer '$smb_username' existiert bereits im System."
+        else
+            useradd -M -s /usr/sbin/nologin "$smb_username"
+        fi
+        usermod -aG smbusers "$smb_username"
+
+        if [ "$HAS_TTY" -eq 1 ]; then
+            echo "--> Samba-Passwort für '$smb_username' festlegen:"
+            smbpasswd -a "$smb_username" </dev/tty
+            smbpasswd -e "$smb_username"
+            echo "--> Samba-Nutzer '$smb_username' angelegt."
+        else
+            warn "Kein Terminal: Passwort später setzen mit 'smbpasswd -a $smb_username'."
+        fi
+    fi
+
     SAMBA_SHARE_DIR="$SHARE_DIR"
 }
 
-# =============================================================================
-# Installations-Status ermitteln und Menü aufbauen
-# =============================================================================
-label_npm=""
-label_docker=""
-label_samba=""
-label_iperf3=""
+harden_ssh() {
+    echo "=== SSH-Härtung ==="
+    check_installed sshd || { warn "sshd nicht installiert – überspringe."; return 0; }
 
-is_npm_installed    && is_pm2_installed    && label_npm="    [bereits installiert]" || label_npm=""
-is_docker_installed                        && label_docker=" [bereits installiert]" || label_docker=""
-is_samba_installed                         && label_samba="  [bereits installiert]" || label_samba=""
-is_iperf3_installed                        && label_iperf3=" [bereits installiert]" || label_iperf3=""
+    if [ "$REAL_USER" = "root" ] || [ ! -s "${REAL_HOME}/.ssh/authorized_keys" ]; then
+        warn "Kein normaler User mit ~/.ssh/authorized_keys gefunden – überspringe (Aussperr-Gefahr)."
+        return 0
+    fi
+    if ! grep -qE '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+        warn "sshd_config bindet sshd_config.d nicht ein – überspringe."
+        return 0
+    fi
 
-echo ""
-echo "================================================="
-echo " Bitte wähle die Zusatzpakete für die Installation:"
-echo " (Bereits installierte Pakete werden übersprungen)"
-echo "================================================="
-echo "1) Nur NPM + PM2          $label_npm"
-echo "2) Nur Docker             $label_docker"
-echo "3) Nur Samba              $label_samba"
-echo "4) Nur iperf3             $label_iperf3"
-echo "5) NPM + Docker           $label_npm $label_docker"
-echo "6) Docker + Samba         $label_docker $label_samba"
-echo "7) NPM + Docker + Samba   $label_npm $label_docker $label_samba"
-echo "8) Alles (inkl. iperf3)   $label_npm $label_docker $label_samba $label_iperf3"
-echo "9) Keine weiteren Pakete installieren"
-echo "================================================="
-read -p "Auswahl [1-9]: " choice </dev/tty
+    # Dateiname "00-": bei sshd gilt "first match wins", cloud-init legt sonst
+    # z.B. 50-cloud-init.conf mit PasswordAuthentication yes an.
+    local CONF="/etc/ssh/sshd_config.d/00-hardening.conf"
+    cat > "$CONF" <<'EOT'
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+EOT
 
-# Auswahl bestätigen lassen
-case $choice in
-    1) choice_label="NPM + PM2" ;;
-    2) choice_label="Docker" ;;
-    3) choice_label="Samba" ;;
-    4) choice_label="iperf3" ;;
-    5) choice_label="NPM + PM2 + Docker" ;;
-    6) choice_label="Docker + Samba" ;;
-    7) choice_label="NPM + PM2 + Docker + Samba" ;;
-    8) choice_label="Alles (NPM + PM2 + Docker + Samba + iperf3)" ;;
-    9) choice_label="Keine weiteren Pakete" ;;
-    *) choice_label="Ungültige Auswahl" ;;
-esac
-
-echo ""
-echo "--> Gewählt: $choice_label"
-read -p "Fortfahren? (j/n): " confirm </dev/tty
-if [[ ! "$confirm" =~ ^[JjYy]$ ]]; then
-    echo "Abgebrochen. Bitte Skript erneut starten."
-    exit 0
-fi
-
-SAMBA_SHARE_DIR=""
-
-# Bereits installierte Pakete überspringen mit Hinweis
-maybe_install_npm_pm2() {
-    if is_npm_installed && is_pm2_installed; then
-        echo "--> NPM + PM2 bereits installiert, überspringe..."
+    mkdir -p /run/sshd
+    if sshd -t; then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd
+        echo "--> SSH gehärtet (Key-only, kein Root-Login) für '$REAL_USER'."
+        echo "--> WICHTIG: Teste den Login in einer ZWEITEN Sitzung, bevor du diese schließt!"
     else
-        install_npm_pm2
+        rm -f "$CONF"
+        die "sshd-Konfiguration ungültig – Härtung zurückgenommen."
     fi
 }
 
-maybe_install_samba() {
+setup_ufw() {
+    echo "=== Firewall (ufw) einrichten ==="
+    apt_install ufw
+
+    local ssh_port
+    ssh_port=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+    ssh_port=${ssh_port:-22}
+
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw limit "${ssh_port}/tcp"
+
     if is_samba_installed; then
-        echo "--> Samba bereits installiert, überspringe..."
-    else
-        install_samba
+        ufw allow Samba
+        ufw allow 3702/udp   # wsdd
+        ufw allow 5357/tcp   # wsdd
     fi
-}
-
-maybe_install_iperf3() {
     if is_iperf3_installed; then
-        echo "--> iperf3 bereits installiert, überspringe..."
-    else
-        install_iperf3
+        ufw allow 5201/tcp
+        ufw allow 5201/udp
+    fi
+
+    ufw --force enable
+    echo "--> ufw aktiv (SSH-Port ${ssh_port}). Weitere Ports: 'ufw allow <port>/tcp'."
+    if is_docker_installed; then
+        echo "--> Hinweis: Von Docker veröffentlichte Ports (-p) umgehen ufw!"
     fi
 }
-
-case $choice in
-    1) maybe_install_npm_pm2 ;;
-    2) install_docker ;;
-    3) maybe_install_samba ;;
-    4) maybe_install_iperf3 ;;
-    5) maybe_install_npm_pm2; install_docker ;;
-    6) install_docker; maybe_install_samba ;;
-    7) maybe_install_npm_pm2; install_docker; maybe_install_samba ;;
-    8) maybe_install_npm_pm2; install_docker; maybe_install_samba; maybe_install_iperf3 ;;
-    9) echo "Keine Zusatzpakete ausgewählt." ;;
-    *) echo "Ungültige Auswahl. Überspringe Zusatzinstallationen." ;;
-esac
 
 # =============================================================================
-# Abschlussmeldung
+# Ausführung (feste, sinnvolle Reihenfolge: Pakete -> SSH-Härtung -> Firewall)
+# =============================================================================
+[ -n "${SEL[nodejs]:-}" ]   && install_nodejs
+[ -n "${SEL[docker]:-}" ]   && install_docker
+[ -n "${SEL[samba]:-}" ]    && { is_samba_installed && echo "--> Samba bereits installiert, passe Konfiguration an..."; install_samba; }
+[ -n "${SEL[iperf3]:-}" ]   && install_iperf3
+[ -n "${SEL[fail2ban]:-}" ] && install_fail2ban
+[ -n "${SEL[ssh]:-}" ]      && harden_ssh
+[ -n "${SEL[ufw]:-}" ]      && setup_ufw
+
+# =============================================================================
+# Abschluss
 # =============================================================================
 echo ""
 echo "=========================================="
-echo "=== Setup erfolgreich abgeschlossen    ==="
-echo "=== $(date '+%Y-%m-%d %H:%M:%S')        ==="
+echo "=== Setup erfolgreich abgeschlossen"
+echo "=== $(date '+%Y-%m-%d %H:%M:%S')"
 echo "=========================================="
-if [ -n "$SAMBA_SHARE_DIR" ]; then
-    echo "  Samba-Freigabe:        $SAMBA_SHARE_DIR"
-fi
+[ -n "$SAMBA_SHARE_DIR" ] && echo "  Samba-Freigabe:        $SAMBA_SHARE_DIR"
 echo "  Log gespeichert unter: $LOG_FILE"
-if [ "$REAL_USER" != "root" ]; then
-    echo "  Hinweis: Bitte einmal neu einloggen,"
-    echo "  damit neue Gruppenrechte für '$REAL_USER' aktiv werden."
+if [ "$ADDED_TO_DOCKER_GROUP" -eq 1 ]; then
+    echo "  Hinweis: Bitte neu einloggen, damit die Docker-Gruppe für '$REAL_USER' aktiv wird."
 fi
+reboot_hint
 echo "=========================================="
